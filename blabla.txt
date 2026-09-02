@@ -1,0 +1,718 @@
+"""
+PottuAI - Main Entry Point
+Run this file to start the application.
+"""
+import argparse
+import time
+import cv2
+
+from config import Config
+from camera import Camera
+from face_detector import FaceDetector
+from target import TargetManager
+from pen_tracker import PenTracker
+from controller import GameController
+from ui import UIManager
+from audio import AudioFeedback
+from esp32 import ESP32Controller
+
+def main():
+    parser = argparse.ArgumentParser(description="PottuAI: Onam Hackathon Demo")
+    parser.add_argument("--mode", type=str, default="demo", choices=["demo", "raspberry"],
+                        help="Run mode: 'demo' (laptop/webcam) or 'raspberry' (pi hardware)")
+    parser.add_argument("--debug", action="store_true", help="Enable debug UI by default")
+    args = parser.parse_args()
+
+    print("========================================")
+    print("        POTTUAI - STARTING UP           ")
+    print(f" Mode: {args.mode}")
+    print("========================================")
+
+    # Initialize Modules
+    config = Config()
+    if args.debug:
+        config.DEBUG_MODE = True
+        
+    camera = Camera(config)
+    face_detector = FaceDetector(config)
+    target_manager = TargetManager(config)
+    pen_tracker = PenTracker(config)
+    
+    # Outputs
+    audio = AudioFeedback(config)
+    esp32 = ESP32Controller(config)
+    
+    # Logic Controller
+    controller = GameController(config, audio, esp32)
+    
+    # UI
+    ui = UIManager(config)
+
+    # Start Hardware
+    camera.start()
+    audio.start()
+    
+    if args.mode == "raspberry" or config.FORCE_ESP32_CONNECT:
+        esp32.connect()
+
+    print("System Ready. Press 'q' to quit, 'd' to toggle debug, 'c' to enter calibration.")
+
+    state = "GAME" # GAME or CALIBRATION
+    
+    try:
+        while True:
+            frame = camera.get_frame()
+            if frame is None:
+                print("Camera error. Exiting...")
+                break
+
+            # 1. Vision Pipeline
+            face_results = face_detector.detect(frame)
+            pen_coords, pen_contour = pen_tracker.detect(frame)
+            
+            target_coords = None
+            if face_results:
+                target_coords = target_manager.update(face_results, frame.shape)
+
+            # 2. Game Logic
+            status_info = controller.update(target_coords, pen_coords)
+
+            # 3. User Interface
+            if state == "GAME":
+                display_frame = ui.draw_game_mode(frame, target_coords, pen_coords, status_info)
+            else:
+                # Basic calibration UI placeholder
+                display_frame = ui.draw_debug_mode(frame, face_results, target_coords, pen_coords, pen_contour, status_info)
+
+            cv2.imshow("PottuAI", display_frame)
+
+            # Keyboard Input Handling
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                break
+            elif key == ord('d'):
+                config.DEBUG_MODE = not config.DEBUG_MODE
+                state = "CALIBRATION" if config.DEBUG_MODE else "GAME"
+                
+    except KeyboardInterrupt:
+        print("Interrupted by user.")
+    finally:
+        print("Shutting down...")
+        camera.stop()
+        audio.stop()
+        esp32.disconnect()
+        cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
+```eof
+
+```python:config.py
+"""
+PottuAI - Configuration Settings
+"""
+import numpy as np
+
+class Config:
+    def __init__(self):
+        # Camera
+        self.CAMERA_INDEX = 0
+        self.FRAME_WIDTH = 640
+        self.FRAME_HEIGHT = 480
+        self.FLIP_CAMERA = True # Mirror effect is usually better for users
+
+        # Face & Target
+        # MediaPipe indices: 10 is top of forehead, 9 is glabella (between eyebrows). 
+        # Using 9 and moving up slightly is a safe bet for a pottu.
+        self.FOREHEAD_LANDMARK = 10 
+        self.FOREHEAD_OFFSET_Y = 15 # Move target up/down relative to landmark (px)
+        self.TARGET_TOLERANCE = 25  # Pixel radius considered "Perfect"
+        self.SMOOTHING_FACTOR = 0.6 # 0.0 to 1.0 (higher = smoother but more lag)
+
+        # Pen Tracking (Red Marker HSV configuration)
+        # Note: Red in HSV wraps around 0/180. Using two ranges is best, but keeping 
+        # it simple for MVP. Adjust these based on the room's lighting.
+        self.PEN_HSV_LOWER = np.array([0, 120, 70])
+        self.PEN_HSV_UPPER = np.array([10, 255, 255])
+        self.PEN_MIN_AREA = 100
+
+        # Logic & Routing
+        self.DEBUG_MODE = False
+        self.DIRECTION_THRESHOLD = 15 # Minimum pixel difference to trigger a direction
+
+        # Audio
+        self.AUDIO_COOLDOWN = 1.5 # Seconds between repeating the *same* command
+        
+        # ESP32
+        self.ESP32_PORT = "/dev/ttyUSB0" # Change to COM3 etc on Windows
+        self.ESP32_BAUDRATE = 115200
+        self.FORCE_ESP32_CONNECT = False
+        self.SERVO_LEFT = 135
+        self.SERVO_CENTER = 90
+        self.SERVO_RIGHT = 45
+```eof
+
+```python:camera.py
+"""
+PottuAI - Camera Wrapper
+"""
+import cv2
+
+class Camera:
+    def __init__(self, config):
+        self.config = config
+        self.cap = None
+
+    def start(self):
+        self.cap = cv2.VideoCapture(self.config.CAMERA_INDEX)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.config.FRAME_WIDTH)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config.FRAME_HEIGHT)
+        if not self.cap.isOpened():
+            print(f"ERROR: Could not open camera {self.config.CAMERA_INDEX}")
+
+    def get_frame(self):
+        if not self.cap or not self.cap.isOpened():
+            return None
+        ret, frame = self.cap.read()
+        if not ret:
+            return None
+            
+        if self.config.FLIP_CAMERA:
+            frame = cv2.flip(frame, 1)
+        return frame
+
+    def stop(self):
+        if self.cap:
+            self.cap.release()
+```eof
+
+```python:face_detector.py
+"""
+PottuAI - Face Detection using MediaPipe
+"""
+import cv2
+import mediapipe as mp
+
+class FaceDetector:
+    def __init__(self, config):
+        self.config = config
+        self.mp_face_mesh = mp.solutions.face_mesh
+        self.face_mesh = self.mp_face_mesh.FaceMesh(
+            max_num_faces=1,
+            refine_landmarks=False,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5
+        )
+
+    def detect(self, frame):
+        # MediaPipe requires RGB
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = self.face_mesh.process(rgb_frame)
+        
+        if results.multi_face_landmarks:
+            # We only care about the first face for this demo
+            return results.multi_face_landmarks[0]
+        return None
+```eof
+
+```python:target.py
+"""
+PottuAI - Target Calculation and Smoothing
+"""
+class TargetManager:
+    def __init__(self, config):
+        self.config = config
+        self.current_target = None
+        self.is_manual_override = False
+        self.manual_target = (0, 0)
+
+    def update(self, face_landmarks, frame_shape):
+        if self.is_manual_override:
+            return self.manual_target
+
+        if not face_landmarks:
+            return self.current_target # Return last known position to prevent flickering
+
+        h, w, _ = frame_shape
+        
+        # Landmark 9 is glabella (between eyebrows), 10 is top of forehead.
+        # We will use 9 as a stable anchor and apply an offset to get the exact pottu spot.
+        anchor = face_landmarks.landmark[9]
+        
+        raw_x = int(anchor.x * w)
+        raw_y = int(anchor.y * h) - self.config.FOREHEAD_OFFSET_Y
+        
+        # Exponential Moving Average Smoothing
+        if self.current_target is None:
+            self.current_target = (raw_x, raw_y)
+        else:
+            alpha = self.config.SMOOTHING_FACTOR
+            smooth_x = int((1 - alpha) * raw_x + alpha * self.current_target[0])
+            smooth_y = int((1 - alpha) * raw_y + alpha * self.current_target[1])
+            self.current_target = (smooth_x, smooth_y)
+            
+        return self.current_target
+
+    def set_manual_target(self, x, y):
+        self.is_manual_override = True
+        self.manual_target = (x, y)
+        self.current_target = (x, y)
+```eof
+
+```python:pen_tracker.py
+"""
+PottuAI - Pen Marker Detection (Color Tracking)
+"""
+import cv2
+import numpy as np
+
+class PenTracker:
+    def __init__(self, config):
+        self.config = config
+        self.current_pos = None
+
+    def detect(self, frame):
+        # Convert BGR to HSV
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        
+        # Threshold the HSV image to get only the specified color
+        mask = cv2.inRange(hsv, self.config.PEN_HSV_LOWER, self.config.PEN_HSV_UPPER)
+        
+        # Morphological operations to remove noise
+        kernel = np.ones((5,5), np.uint8)
+        mask = cv2.erode(mask, kernel, iterations=1)
+        mask = cv2.dilate(mask, kernel, iterations=2)
+        
+        # Find contours
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        if contours:
+            # Find the largest contour
+            largest_contour = max(contours, key=cv2.contourArea)
+            if cv2.contourArea(largest_contour) > self.config.PEN_MIN_AREA:
+                # Find centroid
+                M = cv2.moments(largest_contour)
+                if M["m00"] != 0:
+                    cx = int(M["m10"] / M["m00"])
+                    cy = int(M["m01"] / M["m00"])
+                    
+                    raw_pos = (cx, cy)
+                    
+                    # Smoothing
+                    if self.current_pos is None:
+                        self.current_pos = raw_pos
+                    else:
+                        alpha = self.config.SMOOTHING_FACTOR
+                        smooth_x = int((1 - alpha) * raw_pos[0] + alpha * self.current_pos[0])
+                        smooth_y = int((1 - alpha) * raw_pos[1] + alpha * self.current_pos[1])
+                        self.current_pos = (smooth_x, smooth_y)
+                        
+                    return self.current_pos, largest_contour
+                    
+        return None, None
+```eof
+
+```python:controller.py
+"""
+PottuAI - Game Logic and State Management
+Calculates error and commands hardware.
+"""
+import math
+import time
+
+class GameController:
+    def __init__(self, config, audio, esp32):
+        self.config = config
+        self.audio = audio
+        self.esp32 = esp32
+        
+        self.last_command = None
+        self.last_command_time = 0
+        self.score = 0
+
+    def calculate_score(self, distance):
+        if distance <= self.config.TARGET_TOLERANCE:
+            return 100
+        # Simple linear falloff for demo purposes
+        score = max(0, 100 - (distance - self.config.TARGET_TOLERANCE))
+        return int(score)
+
+    def update(self, target, pen):
+        status = {
+            "state": "SEARCHING",
+            "instruction": "WAITING...",
+            "dx": 0, "dy": 0, "dist": 0,
+            "score": 0
+        }
+
+        if not target:
+            status["instruction"] = "FACE NOT DETECTED"
+            return status
+            
+        if not pen:
+            status["instruction"] = "PEN NOT DETECTED"
+            return status
+
+        # Calculate error
+        dx = target[0] - pen[0]
+        dy = target[1] - pen[1]
+        dist = math.sqrt(dx**2 + dy**2)
+        
+        status["dx"] = dx
+        status["dy"] = dy
+        status["dist"] = dist
+        status["score"] = self.calculate_score(dist)
+
+        # Direction Logic
+        command = "STOP"
+        
+        if dist <= self.config.TARGET_TOLERANCE:
+            status["state"] = "TARGET"
+            command = "STOP"
+        else:
+            status["state"] = "GUIDING"
+            # Note: Screen coords: +x is Right, -x is Left. +y is Down, -y is Up.
+            # But remember we might be flipped. Assuming flipped logic where user moves relative to screen.
+            
+            if abs(dx) > abs(dy):
+                if dx > self.config.DIRECTION_THRESHOLD:
+                    command = "RIGHT"
+                elif dx < -self.config.DIRECTION_THRESHOLD:
+                    command = "LEFT"
+            else:
+                if dy > self.config.DIRECTION_THRESHOLD:
+                    command = "DOWN"
+                elif dy < -self.config.DIRECTION_THRESHOLD:
+                    command = "UP"
+
+        status["instruction"] = command
+
+        # Output Execution (Debounced)
+        current_time = time.time()
+        
+        # Always send STOP immediately if reached
+        if command == "STOP" and self.last_command != "STOP":
+            self.audio.speak("Perfect! Stop.")
+            self.esp32.send_command("STOP")
+            self.last_command = command
+            self.last_command_time = current_time
+            
+        # For movement commands, debounce to avoid spam
+        elif command != "STOP":
+            time_since_last = current_time - self.last_command_time
+            # Speak if it's a NEW command, OR if cooldown has passed
+            if command != self.last_command or time_since_last > self.config.AUDIO_COOLDOWN:
+                self.audio.speak(command)
+                self.esp32.send_command(command)
+                self.last_command = command
+                self.last_command_time = current_time
+
+        return status
+```eof
+
+```python:audio.py
+"""
+PottuAI - Audio Output Module (Offline TTS)
+"""
+import pyttsx3
+import threading
+import queue
+
+class AudioFeedback:
+    def __init__(self, config):
+        self.config = config
+        self.q = queue.Queue()
+        self.thread = None
+        self.running = False
+
+    def _tts_worker(self):
+        # Engine must be initialized in the thread that uses it
+        engine = pyttsx3.init()
+        engine.setProperty('rate', 150) # Slower, clearer speech
+        
+        while self.running:
+            try:
+                # Wait for a command, timeout allows checking self.running
+                text = self.q.get(timeout=0.5) 
+                engine.say(text)
+                engine.runAndWait()
+                self.q.task_done()
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"TTS Error: {e}")
+
+    def start(self):
+        self.running = True
+        self.thread = threading.Thread(target=self._tts_worker, daemon=True)
+        self.thread.start()
+
+    def speak(self, text):
+        if not self.running:
+            return
+            
+        # Empty the queue to prevent backing up old commands
+        with self.q.mutex:
+            self.q.queue.clear()
+            
+        self.q.put(text)
+
+    def stop(self):
+        self.running = False
+        if self.thread:
+            self.thread.join(timeout=1)
+```eof
+
+```python:esp32.py
+"""
+PottuAI - ESP32 Serial Communication
+"""
+import serial
+import threading
+
+class ESP32Controller:
+    def __init__(self, config):
+        self.config = config
+        self.ser = None
+        self.connected = False
+
+    def connect(self):
+        try:
+            self.ser = serial.Serial(self.config.ESP32_PORT, self.config.ESP32_BAUDRATE, timeout=1)
+            self.connected = True
+            print(f"ESP32 Connected on {self.config.ESP32_PORT}")
+        except Exception as e:
+            print(f"ESP32 Connection failed (Running in offline mode): {e}")
+            self.connected = False
+
+    def send_command(self, command):
+        if not self.connected:
+            return
+            
+        try:
+            msg = f"{command}\n".encode('utf-8')
+            self.ser.write(msg)
+        except Exception as e:
+            print(f"ESP32 Write Error: {e}")
+            self.connected = False # Prevent cascading errors
+
+    def disconnect(self):
+        if self.ser and self.ser.is_open:
+            self.send_command("STOP")
+            self.ser.close()
+            self.connected = False
+```eof
+
+```python:ui.py
+"""
+PottuAI - User Interface Rendering
+"""
+import cv2
+import numpy as np
+
+class UIManager:
+    def __init__(self, config):
+        self.config = config
+        # Colors (BGR)
+        self.COLOR_TARGET = (0, 255, 255) # Yellow
+        self.COLOR_PEN = (0, 0, 255)      # Red
+        self.COLOR_LINE = (255, 255, 255) # White
+        self.COLOR_TEXT = (255, 255, 255)
+        self.COLOR_BG = (0, 0, 0)
+        
+    def _draw_hud(self, frame, status):
+        # Draw dark top banner
+        h, w, _ = frame.shape
+        cv2.rectangle(frame, (0, 0), (w, 60), (0,0,0), -1)
+        
+        cv2.putText(frame, "POTTU AI", (20, 40), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 215, 0), 2)
+                    
+        instruction = status.get("instruction", "")
+        color = (0, 255, 0) if instruction == "STOP" else (255, 255, 255)
+        cv2.putText(frame, instruction, (w//2 - 50, 40), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
+                    
+        score = status.get("score", 0)
+        cv2.putText(frame, f"Score: {score}", (w - 150, 40), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
+    def draw_game_mode(self, frame, target, pen, status):
+        display = frame.copy()
+        
+        if target:
+            # Draw target zone
+            cv2.circle(display, target, self.config.TARGET_TOLERANCE, self.COLOR_TARGET, 2)
+            # Center dot
+            cv2.circle(display, target, 3, self.COLOR_TARGET, -1)
+            
+        if pen:
+            # Draw pen tracker
+            cv2.circle(display, pen, 5, self.COLOR_PEN, -1)
+            
+        if target and pen:
+            # Draw connecting line
+            cv2.line(display, pen, target, self.COLOR_LINE, 2)
+            
+        self._draw_hud(display, status)
+        
+        if status.get("state") == "TARGET":
+            h, w, _ = display.shape
+            cv2.putText(display, "PERFECT!", (w//2 - 100, h//2), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
+                        
+        return display
+
+    def draw_debug_mode(self, frame, face_results, target, pen, pen_contour, status):
+        display = frame.copy()
+        
+        # Dim the image slightly for debug mode
+        overlay = display.copy()
+        cv2.rectangle(overlay, (0, 0), (display.shape[1], display.shape[0]), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.4, display, 0.6, 0, display)
+
+        # Draw Face Mesh rough bounding box/points if desired
+        if face_results:
+             import mediapipe as mp
+             mp_drawing = mp.solutions.drawing_utils
+             mp_drawing.draw_landmarks(display, face_results)
+
+        if target:
+            cv2.circle(display, target, self.config.TARGET_TOLERANCE, self.COLOR_TARGET, 2)
+            cv2.putText(display, f"T:{target}", (target[0]+10, target[1]), cv2.FONT_HERSHEY_PLAIN, 1, self.COLOR_TARGET, 1)
+
+        if pen:
+            if pen_contour is not None:
+                cv2.drawContours(display, [pen_contour], -1, (0, 255, 0), 2)
+            cv2.circle(display, pen, 4, self.COLOR_PEN, -1)
+            cv2.putText(display, f"P:{pen}", (pen[0]+10, pen[1]), cv2.FONT_HERSHEY_PLAIN, 1, self.COLOR_PEN, 1)
+
+        if target and pen:
+            cv2.line(display, pen, target, self.COLOR_LINE, 1)
+
+        # Draw Debug Sidebar
+        y = 30
+        cv2.putText(display, "--- DEBUG MODE ---", (10, y), cv2.FONT_HERSHEY_PLAIN, 1.5, (0, 255, 255), 2)
+        y+=30
+        cv2.putText(display, f"State: {status.get('state')}", (10, y), cv2.FONT_HERSHEY_PLAIN, 1, (255, 255, 255), 1)
+        y+=20
+        cv2.putText(display, f"DX: {status.get('dx')}", (10, y), cv2.FONT_HERSHEY_PLAIN, 1, (255, 255, 255), 1)
+        y+=20
+        cv2.putText(display, f"DY: {status.get('dy')}", (10, y), cv2.FONT_HERSHEY_PLAIN, 1, (255, 255, 255), 1)
+        y+=20
+        cv2.putText(display, f"Dist: {status.get('dist'):.1f} px", (10, y), cv2.FONT_HERSHEY_PLAIN, 1, (255, 255, 255), 1)
+        y+=20
+        cv2.putText(display, f"Command: {status.get('instruction')}", (10, y), cv2.FONT_HERSHEY_PLAIN, 1, (0, 255, 0), 1)
+
+        return display
+```eof
+
+```cpp:esp32/pottuai_servo.ino
+/*
+ * PottuAI - ESP32 Servo Controller
+ * Reads serial commands (LEFT, RIGHT, UP, DOWN, STOP) 
+ * and controls a servo motor for redundant physical feedback.
+ */
+
+#include <ESP32Servo.h>
+
+Servo myServo;
+const int SERVO_PIN = 13; // Connect servo signal to GPIO 13
+
+// Angle mappings
+const int ANGLE_LEFT = 135;
+const int ANGLE_CENTER = 90; // Default / STOP position
+const int ANGLE_RIGHT = 45;
+
+String inputString = "";
+bool stringComplete = false;
+
+void setup() {
+  Serial.begin(115200);
+  
+  // ESP32Servo setup
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  ESP32PWM::allocateTimer(2);
+  ESP32PWM::allocateTimer(3);
+  
+  myServo.setPeriodHertz(50); // Standard 50hz servo
+  myServo.attach(SERVO_PIN, 500, 2400);
+  
+  // Move to center on boot
+  myServo.write(ANGLE_CENTER);
+  Serial.println("PottuAI ESP32 Ready.");
+}
+
+void loop() {
+  // Read Serial
+  while (Serial.available()) {
+    char inChar = (char)Serial.read();
+    if (inChar == '\n') {
+      stringComplete = true;
+    } else {
+      inputString += inChar;
+    }
+  }
+
+  // Process Command
+  if (stringComplete) {
+    inputString.trim(); // Remove whitespace
+    
+    if (inputString == "LEFT") {
+      myServo.write(ANGLE_LEFT);
+    } 
+    else if (inputString == "RIGHT") {
+      myServo.write(ANGLE_RIGHT);
+    }
+    else if (inputString == "STOP") {
+      myServo.write(ANGLE_CENTER);
+    }
+    // UP/DOWN are conceptually harder on 1 servo. 
+    // For MVP, we can map them to center or add a second servo later.
+    else if (inputString == "UP" || inputString == "DOWN") {
+       // Optional: Wiggle slightly to indicate vertical movement needed
+       myServo.write(ANGLE_CENTER + 15);
+       delay(100);
+       myServo.write(ANGLE_CENTER - 15);
+       delay(100);
+       myServo.write(ANGLE_CENTER);
+    }
+    
+    // Clear the string
+    inputString = "";
+    stringComplete = false;
+  }
+}
+```eof
+
+```text:requirements.txt
+opencv-python>=4.8.0
+mediapipe>=0.10.0
+numpy>=1.24.0
+pyserial>=3.5
+pyttsx3>=2.90
+```eof
+
+```markdown:README.md
+# PottuAI - Onam Hackathon Demo
+
+PottuAI is a computer-vision powered assistant that helps players play the traditional Onam game "Sundarikk Pottu Thodal" with real-time AI guidance.
+
+## Hardware Setup
+1. **Webcam**: Standard USB webcam facing the Sundari poster.
+2. **Pen**: Attach a bright **RED** marker or LED to the tip of the pen for tracking.
+3. **Audio**: Laptop speakers or Bluetooth earphones connected to the host device.
+4. **ESP32 (Optional Backup)**:
+   * Connect Servo Signal to ESP32 GPIO 13.
+   * Connect Servo 5V to ESP32 VIN (or external 5V if high torque).
+   * Connect Servo GND to ESP32 GND.
+   * Connect ESP32 to host via USB.
+
+## Installation (Laptop/PC First)
+
+1. Create a virtual environment:
+   
+```bash
+   python -m venv pottu_env
+   source pottu_env/bin/activate  # On Windows: pottu_env\Scripts\activate
